@@ -20,9 +20,10 @@ MAX_ATTEMPTS = 4
 SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 
+# Регулярка для поиска ссылок на статьи
 ARTICLE_LINK_RE = re.compile(
-    r'href="(/en-ru/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
-    re.IGNORECASE | re.DOTALL,
+    r'href="(/en-ru/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"',
+    re.IGNORECASE,
 )
 IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 TAG_STRIP_RE = re.compile(r"<[^>]+>")
@@ -58,8 +59,10 @@ def fetch_html():
             resp = requests.get(proxied_url, timeout=70)
             if resp.status_code == 200:
                 return resp.text
-            print(f"Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
-                  f"from ScraperAPI — first 300 chars: {resp.text[:300]}")
+            print(
+                f"Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
+                f"from ScraperAPI — first 300 chars: {resp.text[:300]}"
+            )
         except requests.exceptions.RequestException as e:
             last_error = e
             print(f"Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
@@ -73,17 +76,50 @@ def fetch_html():
 
 def parse_articles(html):
     articles = {}
-    for path, inner_html in ARTICLE_LINK_RE.findall(html):
-        title = TAG_STRIP_RE.sub(" ", inner_html)
-        title = READ_TIME_RE.sub("", title)
-        title = re.sub(r"\s+", " ", title).strip(" -")
-        if not title or len(title) < 3:
-            continue
 
+    # Находим все уникальные пути статей
+    paths = set(ARTICLE_LINK_RE.findall(html))
+
+    for path in paths:
         url = BASE + path
         category = path.split("/")[3]
 
-        img_match = IMG_SRC_RE.search(inner_html)
+        # Ищем фрагмент HTML вокруг ссылки на статью (карточку)
+        escaped_path = re.escape(path)
+        card_match = re.search(
+            r"(?:<article|<div)[^>]*>(?:(?!</article>|</div>).)*?"
+            + escaped_path
+            + r".*?(?:</article>|</div>)",
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+
+        card_html = card_match.group(0) if card_match else ""
+
+        # Извлекаем тексты из карточки
+        texts = [
+            re.sub(r"\s+", " ", TAG_STRIP_RE.sub(" ", t)).strip()
+            for t in re.findall(r"<p[^>]*>(.*?)</p>|<h\d[^>]*>(.*?)</h\d>", card_html, re.DOTALL)
+        ]
+        flat_texts = [t for pair in texts for t in pair if t]
+
+        # Первое текстовое вхождение — заголовок, последующие — описание/анонс
+        title = ""
+        summary = ""
+        for t in flat_texts:
+            t_clean = READ_TIME_RE.sub("", t).strip(" -")
+            if not t_clean or len(t_clean) < 3:
+                continue
+            if not title:
+                title = t_clean
+            elif not summary and t_clean.lower() != title.lower():
+                summary = t_clean
+
+        if not title:
+            continue
+
+        # Картинка
+        img_match = IMG_SRC_RE.search(card_html or html)
         img_url = ""
         if img_match:
             img_url = img_match.group(1)
@@ -95,18 +131,9 @@ def parse_articles(html):
         articles[url] = {
             "title": title,
             "category": category,
+            "summary": summary,
             "image": img_url,
         }
-
-    if not articles:
-        raw_count = len(re.findall(r"/en-ru/journal/[a-z0-9/-]+", html, re.IGNORECASE))
-        print(f"DEBUG: no articles matched. HTML length={len(html)}, "
-              f"raw '/en-ru/journal/...' substrings found={raw_count}")
-        for marker in ("captcha", "access denied", "blocked", "are you human", "px-captcha"):
-            if marker in html.lower():
-                print(f"DEBUG: page HTML contains suspicious marker: '{marker}'")
-        print("DEBUG: first 1000 chars of fetched HTML:")
-        print(html[:1000])
 
     return articles
 
@@ -127,12 +154,18 @@ def build_feed(state):
         fe.category(term=data["category"])
         fe.pubDate(data["first_seen"])
 
+        # Формируем HTML для поля description (картинка + анонс)
+        content_parts = []
         img_url = data.get("image", "")
         if img_url:
-            fe.description(f'<img src="{img_url}" alt="{data["title"]}" />')
+            content_parts.append(f'<img src="{img_url}" alt="{data["title"]}" /><br/>')
             fe.enclosure(url=img_url, type="image/jpeg")
-        else:
-            fe.description("")
+
+        summary = data.get("summary", "")
+        if summary:
+            content_parts.append(f"<p>{summary}</p>")
+
+        fe.description("".join(content_parts) if content_parts else "")
 
     fg.rss_file(FEED_FILE, pretty=True)
 
@@ -152,10 +185,11 @@ def main():
 
     new_count = 0
     for url, data in articles.items():
-        if url not in state or "image" not in state[url]:
+        if url not in state or "summary" not in state[url]:
             state[url] = {
                 "title": data["title"],
                 "category": data["category"],
+                "summary": data.get("summary", ""),
                 "image": data.get("image", ""),
                 "first_seen": state.get(url, {}).get("first_seen", now),
             }
