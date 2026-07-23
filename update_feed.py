@@ -20,12 +20,11 @@ MAX_ATTEMPTS = 4
 SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 
-# Matches links like /en-ru/journal/fashion/logo-trend-25526080
-# (optionally followed by a query string, e.g. ?utm_source=... or ?rsc=1)
 ARTICLE_LINK_RE = re.compile(
     r'href="(/en-ru/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
     re.IGNORECASE | re.DOTALL,
 )
+IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 TAG_STRIP_RE = re.compile(r"<[^>]+>")
 READ_TIME_RE = re.compile(r"\d+\s*MINUTE\s*READ", re.IGNORECASE)
 
@@ -43,8 +42,6 @@ def save_state(state):
 
 
 def fetch_html():
-    """Fetch the Journal page through ScraperAPI's proxy (residential/rotating
-    IPs), which avoids the Akamai edge block that hits GitHub Actions' own IPs."""
     if not SCRAPERAPI_KEY:
         raise RuntimeError(
             "SCRAPERAPI_KEY is not set. Add it as a GitHub repo secret "
@@ -82,9 +79,24 @@ def parse_articles(html):
         title = re.sub(r"\s+", " ", title).strip(" -")
         if not title or len(title) < 3:
             continue
+
         url = BASE + path
         category = path.split("/")[3]
-        articles[url] = {"title": title, "category": category}
+
+        img_match = IMG_SRC_RE.search(inner_html)
+        img_url = ""
+        if img_match:
+            img_url = img_match.group(1)
+            if img_url.startswith("//"):
+                img_url = "https:" + img_url
+            elif img_url.startswith("/"):
+                img_url = BASE + img_url
+
+        articles[url] = {
+            "title": title,
+            "category": category,
+            "image": img_url,
+        }
 
     if not articles:
         raw_count = len(re.findall(r"/en-ru/journal/[a-z0-9/-]+", html, re.IGNORECASE))
@@ -111,10 +123,16 @@ def build_feed(state):
         fe = fg.add_entry()
         fe.id(url)
         fe.title(data["title"])
-        fe.description(data.get("description", ""))
         fe.link(href=url)
         fe.category(term=data["category"])
         fe.pubDate(data["first_seen"])
+
+        img_url = data.get("image", "")
+        if img_url:
+            fe.description(f'<img src="{img_url}" alt="{data["title"]}" />')
+            fe.enclosure(url=img_url, type="image/jpeg")
+        else:
+            fe.description("")
 
     fg.rss_file(FEED_FILE, pretty=True)
 
@@ -134,13 +152,18 @@ def main():
 
     new_count = 0
     for url, data in articles.items():
-        if url not in state:
-            state[url] = {"title": data["title"], "category": data["category"], "first_seen": now}
+        if url not in state or "image" not in state[url]:
+            state[url] = {
+                "title": data["title"],
+                "category": data["category"],
+                "image": data.get("image", ""),
+                "first_seen": state.get(url, {}).get("first_seen", now),
+            }
             new_count += 1
 
     save_state(state)
     build_feed(state)
-    print(f"Checked {len(articles)} articles on page, {new_count} new, feed has {len(state)} total items.")
+    print(f"Checked {len(articles)} articles on page, {new_count} updated/new, feed has {len(state)} total items.")
 
 
 if __name__ == "__main__":
