@@ -5,12 +5,15 @@ import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+from xml.sax.saxutils import escape
 
 import requests
 from feedgen.feed import FeedGenerator
 
 BASE = "https://www.mrporter.com"
 JOURNAL_URL = f"{BASE}/en-gb/journal"
+CATEGORIES = ["fashion", "grooming", "watches", "travel", "lifestyle"]
+PAGES_TO_FETCH = [JOURNAL_URL] + [f"{JOURNAL_URL}/{cat}" for cat in CATEGORIES]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "seen_articles.json")
 FEED_FILE = os.path.join(os.path.dirname(__file__), "mrporter_journal_feed.xml")
@@ -23,14 +26,22 @@ SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Matches links like /en-gb/journal/fashion/logo-trend-25526080
-# (optionally followed by a query string, e.g. ?utm_source=... or ?rsc=1)
-ARTICLE_LINK_RE = re.compile(
-    r'href="(/en-gb/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
+# Article cards on this site are <a href="..." data-type="article">...</a>;
+# product cards use data-type="product" and are excluded by requiring this
+# exact marker. Attribute order (href vs data-type) isn't fixed across card
+# variants, so lookaheads are used instead of anchoring on a fixed order.
+ARTICLE_A_RE = re.compile(
+    r'<a\b(?=[^>]*\bhref="([^"]+)")(?=[^>]*\bdata-type="article")[^>]*>(.*?)</a>',
     re.IGNORECASE | re.DOTALL,
 )
+TITLE_TAG_RE = re.compile(r"<h[12][^>]*>(.*?)</h[12]>", re.IGNORECASE | re.DOTALL)
+PARAGRAPH_RE = re.compile(r"<p[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
+PICTURE_BLOCK_RE = re.compile(r"<picture.*?</picture>", re.IGNORECASE | re.DOTALL)
+NOSCRIPT_BLOCK_RE = re.compile(r"<noscript.*?</noscript>", re.IGNORECASE | re.DOTALL)
 TAG_STRIP_RE = re.compile(r"<[^>]+>")
 READ_TIME_RE = re.compile(r"\d+\s*MINUTE\s*READ", re.IGNORECASE)
+
+IMG_SRC_RE = re.compile(r'<img[^>]+src="([^"]+)"', re.IGNORECASE)
 
 
 def load_state():
@@ -45,9 +56,22 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_html():
-    """Fetch the Journal page through ScraperAPI's proxy (residential/rotating
-    IPs), which avoids the Akamai edge block that hits GitHub Actions' own IPs."""
+def normalize_url(url):
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return BASE + url
+    return url
+
+
+def clean_text(raw_html_fragment):
+    text = TAG_STRIP_RE.sub(" ", raw_html_fragment)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_html(url):
+    """Fetch a page through ScraperAPI's proxy (residential/rotating IPs),
+    which avoids the Akamai edge block that hits GitHub Actions' own IPs."""
     if not SCRAPERAPI_KEY:
         raise RuntimeError(
             "SCRAPERAPI_KEY is not set. Add it as a GitHub repo secret "
@@ -55,7 +79,7 @@ def fetch_html():
             "in the workflow's env."
         )
 
-    params = {"api_key": SCRAPERAPI_KEY, "url": JOURNAL_URL}
+    params = {"api_key": SCRAPERAPI_KEY, "url": url}
     proxied_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(params)}"
 
     last_error = None
@@ -64,64 +88,72 @@ def fetch_html():
             resp = requests.get(proxied_url, timeout=70)
             if resp.status_code == 200:
                 return resp.text
-            print(f"Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
+            print(f"  Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
                   f"from ScraperAPI — first 300 chars: {resp.text[:300]}")
         except requests.exceptions.RequestException as e:
             last_error = e
-            print(f"Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+            print(f"  Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
 
         wait = 5 * attempt
-        print(f"Retrying in {wait}s...")
+        print(f"  Retrying in {wait}s...")
         time.sleep(wait)
 
     raise RuntimeError(f"All {MAX_ATTEMPTS} attempts failed.") from last_error
 
 
-def fetch_article_date(url):
-    """Fetch the individual article page to extract its publication date."""
-    if not SCRAPERAPI_KEY:
-        return None
-        
-    params = {"api_key": SCRAPERAPI_KEY, "url": url}
-    proxied_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(params)}"
-    
-    try:
-        resp = requests.get(proxied_url, timeout=30)
-        if resp.status_code == 200:
-            html = resp.text
-            # 1. Check meta tags
-            m = re.search(r'<meta[^>]*property=["\']article:published_time["\'][^>]*content=["\']([^"\']+)["\']', html)
-            if not m:
-                # 2. Check JSON-LD
-                m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
-            if m:
-                return m.group(1)
-    except Exception as e:
-        print(f"Failed to fetch date for {url}: {e}")
-        
-    return None
-
-
 def parse_articles(html):
     articles = {}
-    for path, inner_html in ARTICLE_LINK_RE.findall(html):
-        title = TAG_STRIP_RE.sub(" ", inner_html)
-        title = READ_TIME_RE.sub("", title)
-        title = re.sub(r"\s+", " ", title).strip(" -")
-        if not title or len(title) < 3:
+    for path, inner_html in ARTICLE_A_RE.findall(html):
+        if "/en-gb/journal/" not in path:
             continue
+        segments = [p for p in path.split("/") if p]
+        # expect en-gb / journal / <category> / <slug>
+        if len(segments) < 4:
+            continue  # topic nav links like /en-gb/journal/fashion itself
+
+        image_match = IMG_SRC_RE.search(inner_html)
+        image = normalize_url(image_match.group(1)) if image_match else None
+
+        # Strip picture/noscript blocks so image markup doesn't pollute title/teaser text
+        text_html = PICTURE_BLOCK_RE.sub("", inner_html)
+        text_html = NOSCRIPT_BLOCK_RE.sub("", text_html)
+
+        title_match = TITLE_TAG_RE.search(text_html)
+        if not title_match:
+            continue
+        title = clean_text(title_match.group(1))
+        if not title:
+            continue
+
+        # Teaser: first <p> after the title that isn't just the read-time
+        # marker and has enough length to be real body copy, not a UI label
+        # like "Continue Reading".
+        teaser = None
+        for p_match in PARAGRAPH_RE.finditer(text_html[title_match.end():]):
+            p_text = clean_text(p_match.group(1))
+            if not p_text or READ_TIME_RE.fullmatch(p_text):
+                continue
+            if len(p_text) > 40:
+                teaser = p_text
+                break
+
         url = BASE + path
-        category = path.split("/")[3]
-        articles[url] = {"title": title, "category": category}
+        category = segments[2]
+        articles[url] = {
+            "title": title,
+            "category": category,
+            "image": image,
+            "teaser": teaser,
+        }
 
     if not articles:
         raw_count = len(re.findall(r"/en-gb/journal/[a-z0-9/-]+", html, re.IGNORECASE))
-        print(f"DEBUG: no articles matched. HTML length={len(html)}, "
+        print(f"  DEBUG: no articles matched. HTML length={len(html)}, "
               f"raw '/en-gb/journal/...' substrings found={raw_count}")
         for marker in ("captcha", "access denied", "blocked", "are you human", "px-captcha"):
             if marker in html.lower():
-                print(f"DEBUG: page HTML contains suspicious marker: '{marker}'")
-        print("DEBUG: first 1000 chars of fetched HTML:")
+                print(f"  DEBUG: page HTML contains suspicious marker: '{marker}'")
+        print("  DEBUG: first 1000 chars of fetched HTML:")
         print(html[:1000])
 
     return articles
@@ -129,27 +161,40 @@ def parse_articles(html):
 
 def post_to_telegram(new_items):
     """Send one message per newly-found article to a Telegram channel.
-    new_items: list of (url, title, category) tuples, oldest first.
+    new_items: list of (url, title, category, image) tuples, oldest first.
     Never raises — a Telegram failure shouldn't block the feed commit."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing) — skipping posting.")
         return
 
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    text_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    photo_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
-    for url, title, category in new_items:
-        text = f"<b>{title}</b>\n#{category}\n{url}"
+    for url, title, category, image in new_items:
+        caption = f"<b>{title}</b>\n#{category}\n{url}"
         try:
-            resp = requests.post(
-                api_url,
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False,
-                },
-                timeout=20,
-            )
+            if image:
+                resp = requests.post(
+                    photo_api_url,
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "photo": image,
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=20,
+                )
+            else:
+                resp = requests.post(
+                    text_api_url,
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": caption,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": False,
+                    },
+                    timeout=20,
+                )
             if resp.status_code != 200:
                 print(f"Telegram send failed for '{title}': HTTP {resp.status_code} — {resp.text[:300]}")
             else:
@@ -160,6 +205,17 @@ def post_to_telegram(new_items):
         time.sleep(1)  # stay well under Telegram's rate limits
 
 
+def guess_image_type(url):
+    ext = url.rsplit(".", 1)[-1].lower().split("?")[0]
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(ext, "image/jpeg")
+
+
 def build_feed(state):
     fg = FeedGenerator()
     fg.title("MR PORTER — The Journal")
@@ -167,23 +223,26 @@ def build_feed(state):
     fg.description("Latest articles from MR PORTER's The Journal.")
     fg.language("en")
 
-    def get_sort_date(data):
-        date_str = data.get("pub_date", data.get("first_seen", ""))
-        try:
-            return datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
-        except ValueError:
-            return datetime.min.replace(tzinfo=timezone.utc)
-
-    # Sort items chronologically by parsed actual date
-    items = sorted(state.items(), key=lambda kv: get_sort_date(kv[1]), reverse=True)[:MAX_ITEMS]
-    
+    items = sorted(state.items(), key=lambda kv: kv[1]["first_seen"], reverse=True)[:MAX_ITEMS]
     for url, data in items:
         fe = fg.add_entry()
         fe.id(url)
         fe.title(data["title"])
         fe.link(href=url)
         fe.category(term=data["category"])
-        fe.pubDate(data.get("pub_date", data.get("first_seen")))
+        fe.pubDate(data["first_seen"])
+
+        image = data.get("image")
+        description_parts = []
+        if image:
+            description_parts.append(f'<img src="{escape(image)}" alt="{escape(data["title"])}"/>')
+        description_parts.append(f"<p>{escape(data['title'])}</p>")
+        if data.get("teaser"):
+            description_parts.append(f"<p>{escape(data['teaser'])}</p>")
+        fe.description("".join(description_parts))
+
+        if image:
+            fe.enclosure(image, "0", guess_image_type(image))
 
     fg.rss_file(FEED_FILE, pretty=True)
 
@@ -191,44 +250,45 @@ def build_feed(state):
 def main():
     state = load_state()
 
-    try:
-        html = fetch_html()
-        articles = parse_articles(html)
-    except RuntimeError as e:
-        print(f"Could not fetch the Journal page this run: {e}")
+    all_articles = {}
+    any_page_succeeded = False
+    for url in PAGES_TO_FETCH:
+        print(f"Fetching {url} ...")
+        try:
+            html = fetch_html(url)
+        except RuntimeError as e:
+            print(f"  Could not fetch this page: {e}")
+            continue
+        any_page_succeeded = True
+        page_articles = parse_articles(html)
+        print(f"  Found {len(page_articles)} article(s) on this page.")
+        all_articles.update(page_articles)  # later pages don't overwrite meaningfully differently
+
+    if not any_page_succeeded:
+        print("Could not fetch any Journal page this run.")
         print("Skipping this run — no changes made. Will try again on the next schedule.")
         sys.exit(0)
 
     now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
 
     new_count = 0
-    new_items = []  # (url, title, category), in the order encountered
-    for url, data in articles.items():
+    new_items = []  # (url, title, category, image), in the order encountered
+    for url, data in all_articles.items():
         if url not in state:
-            pub_date_iso = fetch_article_date(url)
-            pub_date_rfc = now
-            
-            if pub_date_iso:
-                try:
-                    # Parse ISO 8601 (e.g. 2026-07-23T10:00:00Z)
-                    pub_date_iso = pub_date_iso.replace("Z", "+00:00")
-                    dt = datetime.fromisoformat(pub_date_iso)
-                    pub_date_rfc = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
-                except ValueError:
-                    pass
-            
             state[url] = {
-                "title": data["title"], 
-                "category": data["category"], 
-                "pub_date": pub_date_rfc,
-                "first_seen": now
+                "title": data["title"],
+                "category": data["category"],
+                "image": data["image"],
+                "teaser": data["teaser"],
+                "first_seen": now,
             }
             new_count += 1
-            new_items.append((url, data["title"], data["category"]))
+            new_items.append((url, data["title"], data["category"], data["image"]))
 
     save_state(state)
     build_feed(state)
-    print(f"Checked {len(articles)} articles on page, {new_count} new, feed has {len(state)} total items.")
+    print(f"Checked {len(all_articles)} unique articles across {len(PAGES_TO_FETCH)} pages, "
+          f"{new_count} new, feed has {len(state)} total items.")
 
     if new_items:
         new_items.reverse()  # oldest-first, so the channel reads chronologically
