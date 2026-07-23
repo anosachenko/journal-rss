@@ -10,7 +10,7 @@ import requests
 from feedgen.feed import FeedGenerator
 
 BASE = "https://www.mrporter.com"
-JOURNAL_URL = f"{BASE}/en-ru/journal"
+JOURNAL_URL = f"{BASE}/en-gb/journal"
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "seen_articles.json")
 FEED_FILE = os.path.join(os.path.dirname(__file__), "mrporter_journal_feed.xml")
@@ -23,10 +23,10 @@ SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Matches links like /en-ru/journal/fashion/logo-trend-25526080
+# Matches links like /en-gb/journal/fashion/logo-trend-25526080
 # (optionally followed by a query string, e.g. ?utm_source=... or ?rsc=1)
 ARTICLE_LINK_RE = re.compile(
-    r'href="(/en-ru/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
+    r'href="(/en-gb/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
     re.IGNORECASE | re.DOTALL,
 )
 TAG_STRIP_RE = re.compile(r"<[^>]+>")
@@ -77,6 +77,31 @@ def fetch_html():
     raise RuntimeError(f"All {MAX_ATTEMPTS} attempts failed.") from last_error
 
 
+def fetch_article_date(url):
+    """Fetch the individual article page to extract its publication date."""
+    if not SCRAPERAPI_KEY:
+        return None
+        
+    params = {"api_key": SCRAPERAPI_KEY, "url": url}
+    proxied_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(params)}"
+    
+    try:
+        resp = requests.get(proxied_url, timeout=30)
+        if resp.status_code == 200:
+            html = resp.text
+            # 1. Check meta tags
+            m = re.search(r'<meta[^>]*property=["\']article:published_time["\'][^>]*content=["\']([^"\']+)["\']', html)
+            if not m:
+                # 2. Check JSON-LD
+                m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', html)
+            if m:
+                return m.group(1)
+    except Exception as e:
+        print(f"Failed to fetch date for {url}: {e}")
+        
+    return None
+
+
 def parse_articles(html):
     articles = {}
     for path, inner_html in ARTICLE_LINK_RE.findall(html):
@@ -90,9 +115,9 @@ def parse_articles(html):
         articles[url] = {"title": title, "category": category}
 
     if not articles:
-        raw_count = len(re.findall(r"/en-ru/journal/[a-z0-9/-]+", html, re.IGNORECASE))
+        raw_count = len(re.findall(r"/en-gb/journal/[a-z0-9/-]+", html, re.IGNORECASE))
         print(f"DEBUG: no articles matched. HTML length={len(html)}, "
-              f"raw '/en-ru/journal/...' substrings found={raw_count}")
+              f"raw '/en-gb/journal/...' substrings found={raw_count}")
         for marker in ("captcha", "access denied", "blocked", "are you human", "px-captcha"):
             if marker in html.lower():
                 print(f"DEBUG: page HTML contains suspicious marker: '{marker}'")
@@ -142,14 +167,23 @@ def build_feed(state):
     fg.description("Latest articles from MR PORTER's The Journal.")
     fg.language("en")
 
-    items = sorted(state.items(), key=lambda kv: kv[1]["first_seen"], reverse=True)[:MAX_ITEMS]
+    def get_sort_date(data):
+        date_str = data.get("pub_date", data.get("first_seen", ""))
+        try:
+            return datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %z")
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    # Sort items chronologically by parsed actual date
+    items = sorted(state.items(), key=lambda kv: get_sort_date(kv[1]), reverse=True)[:MAX_ITEMS]
+    
     for url, data in items:
         fe = fg.add_entry()
         fe.id(url)
         fe.title(data["title"])
         fe.link(href=url)
         fe.category(term=data["category"])
-        fe.pubDate(data["first_seen"])
+        fe.pubDate(data.get("pub_date", data.get("first_seen")))
 
     fg.rss_file(FEED_FILE, pretty=True)
 
@@ -171,7 +205,24 @@ def main():
     new_items = []  # (url, title, category), in the order encountered
     for url, data in articles.items():
         if url not in state:
-            state[url] = {"title": data["title"], "category": data["category"], "first_seen": now}
+            pub_date_iso = fetch_article_date(url)
+            pub_date_rfc = now
+            
+            if pub_date_iso:
+                try:
+                    # Parse ISO 8601 (e.g. 2026-07-23T10:00:00Z)
+                    pub_date_iso = pub_date_iso.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(pub_date_iso)
+                    pub_date_rfc = dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+                except ValueError:
+                    pass
+            
+            state[url] = {
+                "title": data["title"], 
+                "category": data["category"], 
+                "pub_date": pub_date_rfc,
+                "first_seen": now
+            }
             new_count += 1
             new_items.append((url, data["title"], data["category"]))
 
