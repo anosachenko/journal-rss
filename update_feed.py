@@ -3,7 +3,7 @@ import re
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
@@ -19,6 +19,8 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "seen_articles.json")
 FEED_FILE = os.path.join(os.path.dirname(__file__), "mrporter_journal_feed.xml")
 MAX_ITEMS = 50
 MAX_ATTEMPTS = 4
+RETENTION_DAYS = 30
+DATE_FORMAT = "%a, %d %b %Y %H:%M:%S %z"
 
 SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
@@ -54,6 +56,27 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def prune_old_entries(state):
+    """Drop articles first seen more than RETENTION_DAYS ago, so they stop
+    appearing in the feed and won't be counted/reposted going forward."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    kept = {}
+    dropped = 0
+    for url, data in state.items():
+        try:
+            seen_at = datetime.strptime(data["first_seen"], DATE_FORMAT)
+        except (KeyError, ValueError):
+            kept[url] = data  # keep anything we can't parse, rather than lose it silently
+            continue
+        if seen_at >= cutoff:
+            kept[url] = data
+        else:
+            dropped += 1
+    if dropped:
+        print(f"Pruned {dropped} article(s) older than {RETENTION_DAYS} days.")
+    return kept
 
 
 def normalize_url(url):
@@ -159,6 +182,49 @@ def parse_articles(html):
     return articles
 
 
+def send_telegram_one(text_api_url, photo_api_url, caption, image):
+    """Send a single Telegram message, retrying on 429 by waiting the
+    server-specified retry_after. Returns the final response (or raises
+    on network error)."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        if image:
+            resp = requests.post(
+                photo_api_url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": image,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                timeout=20,
+            )
+        else:
+            resp = requests.post(
+                text_api_url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": caption,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": False,
+                },
+                timeout=20,
+            )
+
+        if resp.status_code != 429:
+            return resp
+
+        try:
+            retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+        except ValueError:
+            retry_after = 5
+        print(f"  Rate limited by Telegram, waiting {retry_after}s before retry "
+              f"({attempt + 1}/{max_retries})...")
+        time.sleep(retry_after + 1)
+
+    return resp  # exhausted retries; caller logs the final failed response
+
+
 def post_to_telegram(new_items):
     """Send one message per newly-found article to a Telegram channel.
     new_items: list of (url, title, category, image) tuples, oldest first.
@@ -173,28 +239,7 @@ def post_to_telegram(new_items):
     for url, title, category, image in new_items:
         caption = f"<b>{title}</b>\n#{category}\n{url}"
         try:
-            if image:
-                resp = requests.post(
-                    photo_api_url,
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "photo": image,
-                        "caption": caption,
-                        "parse_mode": "HTML",
-                    },
-                    timeout=20,
-                )
-            else:
-                resp = requests.post(
-                    text_api_url,
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": caption,
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": False,
-                    },
-                    timeout=20,
-                )
+            resp = send_telegram_one(text_api_url, photo_api_url, caption, image)
             if resp.status_code != 200:
                 print(f"Telegram send failed for '{title}': HTTP {resp.status_code} — {resp.text[:300]}")
             else:
@@ -202,7 +247,7 @@ def post_to_telegram(new_items):
         except requests.exceptions.RequestException as e:
             print(f"Telegram send failed for '{title}': {e}")
 
-        time.sleep(1)  # stay well under Telegram's rate limits
+        time.sleep(1.5)  # stay well under Telegram's rate limits
 
 
 def guess_image_type(url):
@@ -285,10 +330,11 @@ def main():
             new_count += 1
             new_items.append((url, data["title"], data["category"], data["image"]))
 
+    state = prune_old_entries(state)
     save_state(state)
     build_feed(state)
     print(f"Checked {len(all_articles)} unique articles across {len(PAGES_TO_FETCH)} pages, "
-          f"{new_count} new, feed has {len(state)} total items.")
+          f"{new_count} new, feed has {len(state)} total items (retention: {RETENTION_DAYS} days).")
 
     if new_items:
         new_items.reverse()  # oldest-first, so the channel reads chronologically
