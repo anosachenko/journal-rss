@@ -5,12 +5,15 @@ import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+from xml.sax.saxutils import escape
 
 import requests
 from feedgen.feed import FeedGenerator
 
 BASE = "https://www.mrporter.com"
 JOURNAL_URL = f"{BASE}/en-gb/journal"
+CATEGORIES = ["fashion", "grooming", "watches", "travel", "lifestyle"]
+PAGES_TO_FETCH = [JOURNAL_URL] + [f"{JOURNAL_URL}/{cat}" for cat in CATEGORIES]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "seen_articles.json")
 FEED_FILE = os.path.join(os.path.dirname(__file__), "mrporter_journal_feed.xml")
@@ -20,13 +23,23 @@ MAX_ATTEMPTS = 4
 SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Matches links like /en-gb/journal/fashion/logo-trend-25526080, capturing
+# everything inside the <a>...</a> so we can pull the image and blurb out of
+# it too (article cards on this site wrap image+title+byline in one link).
 ARTICLE_LINK_RE = re.compile(
-    r'href="(/en-[a-z]{2}/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"',
-    re.IGNORECASE,
+    r'href="(/en-gb/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
 )
-IMG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 TAG_STRIP_RE = re.compile(r"<[^>]+>")
 READ_TIME_RE = re.compile(r"\d+\s*MINUTE\s*READ", re.IGNORECASE)
+BYLINE_RE = re.compile(r"\s*Words by .+$", re.IGNORECASE)
+
+IMG_DATA_SRC_RE = re.compile(r'<img[^>]+data-src="([^"]+)"', re.IGNORECASE)
+IMG_SRCSET_RE = re.compile(r'<img[^>]+srcset="([^"]+)"', re.IGNORECASE)
+IMG_SRC_RE = re.compile(r'<img[^>]+src="([^"]+)"', re.IGNORECASE)
 
 
 def load_state():
@@ -41,7 +54,32 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_html():
+def normalize_url(url):
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return BASE + url
+    return url
+
+
+def extract_image(inner_html):
+    """Pull an image URL out of an article card. Prefers data-src/srcset
+    (usually the real lazy-loaded image) over a plain src (often a blank
+    placeholder used before JS lazy-loading kicks in)."""
+    m = IMG_DATA_SRC_RE.search(inner_html)
+    if not m:
+        m = IMG_SRCSET_RE.search(inner_html)
+        if m:
+            first_candidate = m.group(1).split(",")[0].strip().split(" ")[0]
+            return normalize_url(first_candidate)
+    if not m:
+        m = IMG_SRC_RE.search(inner_html)
+    return normalize_url(m.group(1)) if m else None
+
+
+def fetch_html(url):
+    """Fetch a page through ScraperAPI's proxy (residential/rotating IPs),
+    which avoids the Akamai edge block that hits GitHub Actions' own IPs."""
     if not SCRAPERAPI_KEY:
         raise RuntimeError(
             "SCRAPERAPI_KEY is not set. Add it as a GitHub repo secret "
@@ -49,7 +87,7 @@ def fetch_html():
             "in the workflow's env."
         )
 
-    params = {"api_key": SCRAPERAPI_KEY, "url": JOURNAL_URL}
+    params = {"api_key": SCRAPERAPI_KEY, "url": url}
     proxied_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(params)}"
 
     last_error = None
@@ -58,14 +96,14 @@ def fetch_html():
             resp = requests.get(proxied_url, timeout=70)
             if resp.status_code == 200:
                 return resp.text
-            print(f"Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
+            print(f"  Attempt {attempt}/{MAX_ATTEMPTS}: HTTP {resp.status_code} "
                   f"from ScraperAPI — first 300 chars: {resp.text[:300]}")
         except requests.exceptions.RequestException as e:
             last_error = e
-            print(f"Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
+            print(f"  Attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
 
         wait = 5 * attempt
-        print(f"Retrying in {wait}s...")
+        print(f"  Retrying in {wait}s...")
         time.sleep(wait)
 
     raise RuntimeError(f"All {MAX_ATTEMPTS} attempts failed.") from last_error
@@ -73,60 +111,97 @@ def fetch_html():
 
 def parse_articles(html):
     articles = {}
-    paths = set(ARTICLE_LINK_RE.findall(html))
+    for path, inner_html in ARTICLE_LINK_RE.findall(html):
+        image = extract_image(inner_html)
 
-    for path in paths:
-        url = BASE + path
-        category = path.split("/")[3]
+        text = TAG_STRIP_RE.sub(" ", inner_html)
+        text = READ_TIME_RE.sub("", text)
+        text = re.sub(r"\s+", " ", text).strip(" -")
 
-        escaped_path = re.escape(path)
-        card_match = re.search(
-            r"(?:<article|<div)[^>]*>(?:(?!</article>|</div>).)*?"
-            + escaped_path
-            + r".*?(?:</article>|</div>)",
-            html,
-            re.IGNORECASE | re.DOTALL,
-        )
+        byline_match = BYLINE_RE.search(text)
+        byline = byline_match.group(0).strip() if byline_match else None
+        title = BYLINE_RE.sub("", text).strip()
 
-        card_html = card_match.group(0) if card_match else ""
-
-        texts = [
-            re.sub(r"\s+", " ", TAG_STRIP_RE.sub(" ", t)).strip()
-            for t in re.findall(r"<p[^>]*>(.*?)</p>|<h\d[^>]*>(.*?)</h\d>", card_html, re.DOTALL)
-        ]
-        flat_texts = [t for pair in texts for t in pair if t]
-
-        title = ""
-        summary = ""
-        for t in flat_texts:
-            t_clean = READ_TIME_RE.sub("", t).strip(" -")
-            if not t_clean or len(t_clean) < 3:
-                continue
-            if not title:
-                title = t_clean
-            elif not summary and t_clean.lower() != title.lower():
-                summary = t_clean
-
-        if not title:
+        if not title or len(title) < 3:
             continue
 
-        img_match = IMG_SRC_RE.search(card_html or html)
-        img_url = ""
-        if img_match:
-            img_url = img_match.group(1)
-            if img_url.startswith("//"):
-                img_url = "https:" + img_url
-            elif img_url.startswith("/"):
-                img_url = BASE + img_url
-
+        url = BASE + path
+        category = path.split("/")[3]
         articles[url] = {
             "title": title,
             "category": category,
-            "summary": summary,
-            "image": img_url,
+            "image": image,
+            "byline": byline,
         }
 
+    if not articles:
+        raw_count = len(re.findall(r"/en-gb/journal/[a-z0-9/-]+", html, re.IGNORECASE))
+        print(f"  DEBUG: no articles matched. HTML length={len(html)}, "
+              f"raw '/en-gb/journal/...' substrings found={raw_count}")
+        for marker in ("captcha", "access denied", "blocked", "are you human", "px-captcha"):
+            if marker in html.lower():
+                print(f"  DEBUG: page HTML contains suspicious marker: '{marker}'")
+        print("  DEBUG: first 1000 chars of fetched HTML:")
+        print(html[:1000])
+
     return articles
+
+
+def post_to_telegram(new_items):
+    """Send one message per newly-found article to a Telegram channel.
+    new_items: list of (url, title, category, image) tuples, oldest first.
+    Never raises — a Telegram failure shouldn't block the feed commit."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing) — skipping posting.")
+        return
+
+    text_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    photo_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+
+    for url, title, category, image in new_items:
+        caption = f"<b>{title}</b>\n#{category}\n{url}"
+        try:
+            if image:
+                resp = requests.post(
+                    photo_api_url,
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "photo": image,
+                        "caption": caption,
+                        "parse_mode": "HTML",
+                    },
+                    timeout=20,
+                )
+            else:
+                resp = requests.post(
+                    text_api_url,
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": caption,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": False,
+                    },
+                    timeout=20,
+                )
+            if resp.status_code != 200:
+                print(f"Telegram send failed for '{title}': HTTP {resp.status_code} — {resp.text[:300]}")
+            else:
+                print(f"Posted to Telegram: {title}")
+        except requests.exceptions.RequestException as e:
+            print(f"Telegram send failed for '{title}': {e}")
+
+        time.sleep(1)  # stay well under Telegram's rate limits
+
+
+def guess_image_type(url):
+    ext = url.rsplit(".", 1)[-1].lower().split("?")[0]
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(ext, "image/jpeg")
 
 
 def build_feed(state):
@@ -145,17 +220,17 @@ def build_feed(state):
         fe.category(term=data["category"])
         fe.pubDate(data["first_seen"])
 
-        content_parts = []
-        img_url = data.get("image", "")
-        if img_url:
-            content_parts.append(f'<img src="{img_url}" alt="{data["title"]}" /><br/>')
-            fe.enclosure(url=img_url, type="image/jpeg")
+        image = data.get("image")
+        description_parts = []
+        if image:
+            description_parts.append(f'<img src="{escape(image)}" alt="{escape(data["title"])}"/>')
+        description_parts.append(f"<p>{escape(data['title'])}</p>")
+        if data.get("byline"):
+            description_parts.append(f"<p>{escape(data['byline'])}</p>")
+        fe.description("".join(description_parts))
 
-        summary = data.get("summary", "")
-        if summary:
-            content_parts.append(f"<p>{summary}</p>")
-
-        fe.description("".join(content_parts) if content_parts else "")
+        if image:
+            fe.enclosure(image, "0", guess_image_type(image))
 
     fg.rss_file(FEED_FILE, pretty=True)
 
@@ -163,31 +238,49 @@ def build_feed(state):
 def main():
     state = load_state()
 
-    try:
-        html = fetch_html()
-        articles = parse_articles(html)
-    except RuntimeError as e:
-        print(f"Could not fetch the Journal page this run: {e}")
+    all_articles = {}
+    any_page_succeeded = False
+    for url in PAGES_TO_FETCH:
+        print(f"Fetching {url} ...")
+        try:
+            html = fetch_html(url)
+        except RuntimeError as e:
+            print(f"  Could not fetch this page: {e}")
+            continue
+        any_page_succeeded = True
+        page_articles = parse_articles(html)
+        print(f"  Found {len(page_articles)} article(s) on this page.")
+        all_articles.update(page_articles)  # later pages don't overwrite meaningfully differently
+
+    if not any_page_succeeded:
+        print("Could not fetch any Journal page this run.")
         print("Skipping this run — no changes made. Will try again on the next schedule.")
         sys.exit(0)
 
     now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
 
     new_count = 0
-    for url, data in articles.items():
-        if url not in state or "summary" not in state[url] or "image" not in state[url]:
+    new_items = []  # (url, title, category, image), in the order encountered
+    for url, data in all_articles.items():
+        if url not in state:
             state[url] = {
                 "title": data["title"],
                 "category": data["category"],
-                "summary": data.get("summary", ""),
-                "image": data.get("image", ""),
-                "first_seen": state.get(url, {}).get("first_seen", now),
+                "image": data["image"],
+                "byline": data["byline"],
+                "first_seen": now,
             }
             new_count += 1
+            new_items.append((url, data["title"], data["category"], data["image"]))
 
     save_state(state)
     build_feed(state)
-    print(f"Checked {len(articles)} articles on page, {new_count} updated/new, feed has {len(state)} total items.")
+    print(f"Checked {len(all_articles)} unique articles across {len(PAGES_TO_FETCH)} pages, "
+          f"{new_count} new, feed has {len(state)} total items.")
+
+    if new_items:
+        new_items.reverse()  # oldest-first, so the channel reads chronologically
+        post_to_telegram(new_items)
 
 
 if __name__ == "__main__":
