@@ -27,6 +27,8 @@ jobs:
       - name: Run scraper / feed builder
         env:
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python update_feed.py
 
       - name: Commit updated feed if changed
