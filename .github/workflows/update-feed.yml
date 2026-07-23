@@ -1,0 +1,38 @@
+name: Update MR PORTER Journal RSS feed
+
+on:
+  schedule:
+    - cron: "0 6 * * *"    # 09:00 Moscow time (MSK = UTC+3, no DST)
+    - cron: "0 18 * * *"   # 21:00 Moscow time
+  workflow_dispatch: {}       # allows manual "Run workflow" button too
+
+permissions:
+  contents: write
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper / feed builder
+        env:
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+        run: python update_feed.py
+
+      - name: Commit updated feed if changed
+        run: |
+          git config user.name "feed-bot"
+          git config user.email "feed-bot@users.noreply.github.com"
+          git add mrporter_journal_feed.xml seen_articles.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update feed [skip ci]"
+          git push
