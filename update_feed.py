@@ -3,6 +3,7 @@ import re
 import os
 import sys
 import time
+import html as html_module
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -21,7 +22,6 @@ SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/"
 
 # Matches links like /en-ru/journal/fashion/logo-trend-25526080
-# (optionally followed by a query string, e.g. ?utm_source=... or ?rsc=1)
 ARTICLE_LINK_RE = re.compile(
     r'href="(/en-ru/journal/(?:fashion|grooming|watches|travel|lifestyle)/[a-z0-9-]+)(?:\?[^"]*)?"[^>]*>(.*?)</a>',
     re.IGNORECASE | re.DOTALL,
@@ -42,9 +42,8 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def fetch_html():
-    """Fetch the Journal page through ScraperAPI's proxy (residential/rotating
-    IPs), which avoids the Akamai edge block that hits GitHub Actions' own IPs."""
+def fetch_html(url):
+    """Fetch a page through ScraperAPI's proxy."""
     if not SCRAPERAPI_KEY:
         raise RuntimeError(
             "SCRAPERAPI_KEY is not set. Add it as a GitHub repo secret "
@@ -52,7 +51,7 @@ def fetch_html():
             "in the workflow's env."
         )
 
-    params = {"api_key": SCRAPERAPI_KEY, "url": JOURNAL_URL}
+    params = {"api_key": SCRAPERAPI_KEY, "url": url}
     proxied_url = f"{SCRAPERAPI_ENDPOINT}?{urlencode(params)}"
 
     last_error = None
@@ -72,6 +71,43 @@ def fetch_html():
         time.sleep(wait)
 
     raise RuntimeError(f"All {MAX_ATTEMPTS} attempts failed.") from last_error
+
+
+def parse_article_details(html):
+    """Extract og:image and og:description from an article's HTML."""
+    image_url = None
+    description = None
+
+    # Ищем og:image
+    img_match = re.search(
+        r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE
+    )
+    if not img_match:
+        img_match = re.search(
+            r'<meta\s+name=["\']twitter:image["\']\s+content=["\']([^"\']+)["\']',
+            html, re.IGNORECASE
+        )
+    if img_match:
+        image_url = html_module.unescape(img_match.group(1))
+
+    # Ищем og:description
+    desc_match = re.search(
+        r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE
+    )
+    if not desc_match:
+        desc_match = re.search(
+            r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+            html, re.IGNORECASE
+        )
+    if desc_match:
+        description = html_module.unescape(desc_match.group(1))
+        # Очищаем от HTML-тегов, если они вдруг попали в описание
+        description = TAG_STRIP_RE.sub(" ", description)
+        description = re.sub(r"\s+", " ", description).strip()
+
+    return image_url, description
 
 
 def parse_articles(html):
@@ -115,6 +151,20 @@ def build_feed(state):
         fe.category(term=data["category"])
         fe.pubDate(data["first_seen"])
 
+        description = data.get("description") or data["title"]
+        image_url = data.get("image")
+
+        # Добавляем обычное текстовое описание
+        fe.description(description)
+
+        # Если есть картинка, добавляем её через enclosure (стандарт для RSS-ридеров)
+        # и формируем HTML-версию описания, чтобы картинка отображалась прямо в тексте
+        if image_url:
+            fe.enclosure(image_url, 0, "image/jpeg")
+            
+            html_content = f'<img src="{image_url}" alt="{data["title"]}"/><br/><p>{description}</p>'
+            fe.content(html_content, type='html')
+
     fg.rss_file(FEED_FILE, pretty=True)
 
 
@@ -122,7 +172,7 @@ def main():
     state = load_state()
 
     try:
-        html = fetch_html()
+        html = fetch_html(JOURNAL_URL)
         articles = parse_articles(html)
     except RuntimeError as e:
         print(f"Could not fetch the Journal page this run: {e}")
@@ -134,8 +184,32 @@ def main():
     new_count = 0
     for url, data in articles.items():
         if url not in state:
-            state[url] = {"title": data["title"], "category": data["category"], "first_seen": now}
-            new_count += 1
+            print(f"New article found: {data['title']}. Fetching details...")
+            try:
+                # Парсим саму статью ради картинки и описания
+                article_html = fetch_html(url)
+                image_url, description = parse_article_details(article_html)
+                
+                state[url] = {
+                    "title": data["title"],
+                    "category": data["category"],
+                    "first_seen": now,
+                    "image": image_url,
+                    "description": description
+                }
+                new_count += 1
+                # Небольшая пауза, чтобы не бомбардировать API запросами
+                time.sleep(1) 
+            except Exception as e:
+                print(f"Failed to fetch details for {url}: {e}. Saving without image/description.")
+                state[url] = {
+                    "title": data["title"],
+                    "category": data["category"],
+                    "first_seen": now,
+                    "image": None,
+                    "description": None
+                }
+                new_count += 1
 
     save_state(state)
     build_feed(state)
