@@ -2,12 +2,12 @@
 <rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">
   <channel>
     <title>MR PORTER — The Journal</title>
-    <link>https://www.mrporter.com/en-ru/journal</link>
+    <link>https://www.mrporter.com/en-gb/journal</link>
     <description>Latest articles from MR PORTER's The Journal.</description>
     <docs>http://www.rssboard.org/rss-specification</docs>
     <generator>python-feedgen</generator>
     <language>en</language>
-    <lastBuildDate>Thu, 23 Jul 2026 10:14:43 +0000</lastBuildDate>
+    <lastBuildDate>Thu, 23 Jul 2026 11:44:20 +0000</lastBuildDate>
     <item>
       <title>Weaving Tales From Aran</title>
       <link>https://www.mrporter.com/en-ru/journal/fashion/inis-meain-film-25526428</link>
