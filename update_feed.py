@@ -8,7 +8,6 @@ from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
 import requests
-from feedgen.feed import FeedGenerator
 
 BASE = "https://www.mrporter.com"
 JOURNAL_URL = f"{BASE}/en-gb/journal"
@@ -16,8 +15,6 @@ CATEGORIES = ["fashion", "grooming", "watches", "travel", "lifestyle"]
 PAGES_TO_FETCH = [JOURNAL_URL] + [f"{JOURNAL_URL}/{cat}" for cat in CATEGORIES]
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "seen_articles.json")
-FEED_FILE = os.path.join(os.path.dirname(__file__), "mrporter_journal_feed.xml")
-MAX_ITEMS = 50
 MAX_ATTEMPTS = 4
 RETENTION_DAYS = 30
 DATE_FORMAT = "%a, %d %b %Y %H:%M:%S %z"
@@ -59,8 +56,8 @@ def save_state(state):
 
 
 def prune_old_entries(state):
-    """Drop articles first seen more than RETENTION_DAYS ago, so they stop
-    appearing in the feed and won't be counted/reposted going forward."""
+    """Drop articles first seen more than RETENTION_DAYS ago, so the
+    dedup file stops growing forever."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
     kept = {}
     dropped = 0
@@ -182,6 +179,21 @@ def parse_articles(html):
     return articles
 
 
+def build_caption(data, url):
+    """Telegram caption: bold title, teaser (if any), category hashtag, link.
+    Telegram captions are capped at 1024 chars, so the teaser is trimmed."""
+    parts = [f"<b>{escape(data['title'])}</b>"]
+    if data.get("teaser"):
+        teaser = data["teaser"]
+        max_teaser_len = 700
+        if len(teaser) > max_teaser_len:
+            teaser = teaser[:max_teaser_len].rsplit(" ", 1)[0] + "…"
+        parts.append(escape(teaser))
+    parts.append(f"#{data['category']}")
+    parts.append(url)
+    return "\n\n".join(parts)
+
+
 def send_telegram_one(text_api_url, photo_api_url, caption, image):
     """Send a single Telegram message, retrying on 429 by waiting the
     server-specified retry_after. Returns the final response (or raises
@@ -226,9 +238,10 @@ def send_telegram_one(text_api_url, photo_api_url, caption, image):
 
 
 def post_to_telegram(new_items):
-    """Send one message per newly-found article to a Telegram channel.
-    new_items: list of (url, title, category, image) tuples, oldest first.
-    Never raises — a Telegram failure shouldn't block the feed commit."""
+    """Send one message per newly-found article to a Telegram channel,
+    including the teaser text and image. new_items: list of (url, data)
+    tuples, oldest first. Never raises — a Telegram failure here shouldn't
+    block saving the dedup state."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing) — skipping posting.")
         return
@@ -236,60 +249,18 @@ def post_to_telegram(new_items):
     text_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     photo_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
 
-    for url, title, category, image in new_items:
-        caption = f"<b>{title}</b>\n#{category}\n{url}"
+    for url, data in new_items:
+        caption = build_caption(data, url)
         try:
-            resp = send_telegram_one(text_api_url, photo_api_url, caption, image)
+            resp = send_telegram_one(text_api_url, photo_api_url, caption, data.get("image"))
             if resp.status_code != 200:
-                print(f"Telegram send failed for '{title}': HTTP {resp.status_code} — {resp.text[:300]}")
+                print(f"Telegram send failed for '{data['title']}': HTTP {resp.status_code} — {resp.text[:300]}")
             else:
-                print(f"Posted to Telegram: {title}")
+                print(f"Posted to Telegram: {data['title']}")
         except requests.exceptions.RequestException as e:
-            print(f"Telegram send failed for '{title}': {e}")
+            print(f"Telegram send failed for '{data['title']}': {e}")
 
         time.sleep(1.5)  # stay well under Telegram's rate limits
-
-
-def guess_image_type(url):
-    ext = url.rsplit(".", 1)[-1].lower().split("?")[0]
-    return {
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp",
-        "gif": "image/gif",
-    }.get(ext, "image/jpeg")
-
-
-def build_feed(state):
-    fg = FeedGenerator()
-    fg.title("MR PORTER — The Journal")
-    fg.link(href=JOURNAL_URL, rel="alternate")
-    fg.description("Latest articles from MR PORTER's The Journal.")
-    fg.language("en")
-
-    items = sorted(state.items(), key=lambda kv: kv[1]["first_seen"], reverse=True)[:MAX_ITEMS]
-    for url, data in items:
-        fe = fg.add_entry()
-        fe.id(url)
-        fe.title(data["title"])
-        fe.link(href=url)
-        fe.category(term=data["category"])
-        fe.pubDate(data["first_seen"])
-
-        image = data.get("image")
-        description_parts = []
-        if image:
-            description_parts.append(f'<img src="{escape(image)}" alt="{escape(data["title"])}"/>')
-        description_parts.append(f"<p>{escape(data['title'])}</p>")
-        if data.get("teaser"):
-            description_parts.append(f"<p>{escape(data['teaser'])}</p>")
-        fe.description("".join(description_parts))
-
-        if image:
-            fe.enclosure(image, "0", guess_image_type(image))
-
-    fg.rss_file(FEED_FILE, pretty=True)
 
 
 def main():
@@ -307,17 +278,16 @@ def main():
         any_page_succeeded = True
         page_articles = parse_articles(html)
         print(f"  Found {len(page_articles)} article(s) on this page.")
-        all_articles.update(page_articles)  # later pages don't overwrite meaningfully differently
+        all_articles.update(page_articles)
 
     if not any_page_succeeded:
         print("Could not fetch any Journal page this run.")
         print("Skipping this run — no changes made. Will try again on the next schedule.")
         sys.exit(0)
 
-    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    now = datetime.now(timezone.utc).strftime(DATE_FORMAT)
 
-    new_count = 0
-    new_items = []  # (url, title, category, image), in the order encountered
+    new_items = []  # (url, data), in the order encountered
     for url, data in all_articles.items():
         if url not in state:
             state[url] = {
@@ -327,14 +297,12 @@ def main():
                 "teaser": data["teaser"],
                 "first_seen": now,
             }
-            new_count += 1
-            new_items.append((url, data["title"], data["category"], data["image"]))
+            new_items.append((url, state[url]))
 
     state = prune_old_entries(state)
     save_state(state)
-    build_feed(state)
     print(f"Checked {len(all_articles)} unique articles across {len(PAGES_TO_FETCH)} pages, "
-          f"{new_count} new, feed has {len(state)} total items (retention: {RETENTION_DAYS} days).")
+          f"{len(new_items)} new (retention: {RETENTION_DAYS} days, {len(state)} tracked).")
 
     if new_items:
         new_items.reverse()  # oldest-first, so the channel reads chronologically
