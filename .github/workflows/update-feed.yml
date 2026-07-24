@@ -2,8 +2,8 @@ name: Post new MR PORTER Journal articles to Telegram
 
 on:
   schedule:
-    - cron: "0 6 * * *"    # 09:00 Moscow time (MSK = UTC+3, no DST)
-    - cron: "0 18 * * *"   # 21:00 Moscow time
+    - cron: "7 6 * * *"    # ~09:07 Moscow time (MSK = UTC+3, no DST)
+    - cron: "13 18 * * *"  # ~21:13 Moscow time
   workflow_dispatch: {}       # allows manual "Run workflow" button too
 
 permissions:
