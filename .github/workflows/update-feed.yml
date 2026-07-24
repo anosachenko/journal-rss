@@ -1,4 +1,4 @@
-name: Update MR PORTER Journal RSS feed
+name: Post new MR PORTER Journal articles to Telegram
 
 on:
   schedule:
@@ -24,17 +24,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scraper / feed builder
+      - name: Run scraper / Telegram poster
         env:
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python update_feed.py
+        run: python -u update_feed.py
 
-      - name: Commit updated feed if changed
+      - name: Commit updated dedup state if changed
         run: |
           git config user.name "feed-bot"
           git config user.email "feed-bot@users.noreply.github.com"
-          git add mrporter_journal_feed.xml seen_articles.json 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "Update feed [skip ci]"
+          git add seen_articles.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update seen articles [skip ci]"
           git push
