@@ -1,11 +1,4 @@
 {
-  "https://www.mrporter.com/en-gb/journal/fashion/how-our-trousers-have-shaped-the-past-century-25737060": {
-    "title": "How Our Trousers Have Shaped The Past Century (And Vice Versa)",
-    "category": "fashion",
-    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25737444/6576527d1451ff1d5ca11945976e1ec3/16x9-opener-png-data.png/w800_q80.jpg",
-    "teaser": "The world has changed a lot in the last 100 years. In fact, it took less than 70 years to go from the first powered flight to landing on the Moon. We put wheels on suitcases. We’ve had nine different (live action) Batman films. If you asked an economist to explain this last century, they might look at a graph of real GDP. An engineer could consider the development of semiconductors. What if instead we looked at the evolution of trousers?",
-    "first_seen": "Tue, 25 Aug 2026 06:59:27 +0000"
-  },
   "https://www.mrporter.com/en-gb/journal/travel/carhartt-workwear-hollywood-25737482": {
     "title": "Why Is Carhartt Hollywood’s Go-To Workwear Brand?",
     "category": "travel",
@@ -404,5 +397,26 @@
     "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25525214/db9068b5058549d780a1fa273dcc11b5/opener-jpg-data.jpg/w800_q80.jpg",
     "teaser": null,
     "first_seen": "Wed, 23 Sep 2026 21:27:16 +0000"
+  },
+  "https://www.mrporter.com/en-gb/journal/fashion/how-to-get-stripes-right-749124": {
+    "title": "The Official Line On Wearing Stripes",
+    "category": "fashion",
+    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25746746/536330de6fc6448fb28806a2365bbffa/16x9-opener-png-data.png/w800_q80.jpg",
+    "teaser": "When it comes to adding stripes to your wardrobe, where do you draw the line? Vertical? Horizontal? Both? How many colours are too many? And that’s before we’ve even started on width. Whether on shirts, tees, jackets or ties, stripes are a smart move this season – when colour and pattern can really carry an outfit – but perilously easy to get wrong. Here’s a guide to learning your lines.",
+    "first_seen": "Thu, 24 Sep 2026 11:33:51 +0000"
+  },
+  "https://www.mrporter.com/en-gb/journal/fashion/ways-to-wear-utility-pants-25746576": {
+    "title": "Three Ways To Wear Utility Trousers",
+    "category": "fashion",
+    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25746686/a68feac9bdf5cc507b94955fca7c87b2/16x9-opener-a-png-data.png/w800_q80.jpg",
+    "teaser": "Utility trousers come in all shapes, forms and functions. Cargo styles were initially made for soldiers; carpenter and painter’s trousers were designed to fit tools while fatigue pants were cut to facilitate movement and durability. Despite their humble beginnings, the drawstring waists, patch pockets, tool loops and a field-inspired coloured palette of utility trousers have all left their mark on everyday dressing. Today, they are championed by anyone from heritage workwear labels to luxury brands and more contemporary designers. The result is an offering that’s as varied as its origins – and just as adaptable.",
+    "first_seen": "Thu, 24 Sep 2026 11:33:51 +0000"
+  },
+  "https://www.mrporter.com/en-gb/journal/watches/watch-trends-25168936": {
+    "title": "Watch Experts’ Predictions For 2025",
+    "category": "watches",
+    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25169154/1736fa0ea23e7f5643f43b9a0e49b1a6/new-02-hero-watch-trends-25-copy-jpg-data.jpg/w800_q80.jpg",
+    "teaser": null,
+    "first_seen": "Thu, 24 Sep 2026 11:33:51 +0000"
   }
 }
