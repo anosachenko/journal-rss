@@ -1,11 +1,4 @@
 {
-  "https://www.mrporter.com/en-gb/journal/fashion/fortela-collection-launch-25739934": {
-    "title": "Introducing Fortela",
-    "category": "fashion",
-    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25740006/6cbb95996cf2713d45b8126498c140a3/16x9-opener-jpg-1--data.jpg/w800_q80.jpg",
-    "teaser": "Referential design is nothing new. It is a standard practice among brands today, used to create garments that balance nostalgic appeal with a sense of contemporary freshness. Too often, however, the reference is merely performative – a superficial exercise in aesthetic nostalgia that falls short of capturing what made the original garments so compelling in the first place. With Fortela, the Milanese brand founded by Alessandro Squarzi – one of the most photographed figures in modern menswear street style – referencing the past is far more fundamental.",
-    "first_seen": "Wed, 02 Sep 2026 20:59:07 +0000"
-  },
   "https://www.mrporter.com/en-gb/journal/lifestyle/33-ways-interiors-design-home-decorate-expert-tips-23836914": {
     "title": "15 Ways To Give Your Home A Facelift",
     "category": "lifestyle",
@@ -418,5 +411,12 @@
     "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25750068/ca219dd40fa3a15b6d12fff2d1a83cfc/16x9-opener-c-jpg-data.jpg/w800_q80.jpg",
     "teaser": "Sourcing the finest clothes known to humankind is one thing. Keeping them that way is another entirely. And where you’d expect to come to MR PORTER for the former, we have some thoughts on the latter, too. From a general guide to making your clothes last longer to more specific instructions that focus on sneakers, coats, watches and knitwear, below is an exhaustive compendium on wardrobe maintenance.",
     "first_seen": "Fri, 02 Oct 2026 12:21:11 +0000"
+  },
+  "https://www.mrporter.com/en-gb/journal/fashion/new-brands-to-know-25373406": {
+    "title": "The New-To-Us Brands To Look Out For",
+    "category": "fashion",
+    "image": "https://www.mrporter.com/content/images/cms/ycm/resource/blob/25751044/7def3039dfe7db710540789ab2a28c73/new-brands-update-jpeg-data.jpg/w800_q80.jpg",
+    "teaser": null,
+    "first_seen": "Fri, 02 Oct 2026 22:08:10 +0000"
   }
 }
